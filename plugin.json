@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "taste-skill",
+  "displayName": "Taste Skill",
+  "version": "2.5.1",
+  "description": "Anti-slop frontend craft skill for company websites with one design system, real product UI, photographs, and browser verification.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Design a professional company website without generic AI patterns.",
+    "Redesign this landing page while preserving its brand and content.",
+    "Build a product page with real UI cards and one section per screen."
+  ],
+  "author": {
+    "name": "Leonxlnx",
+    "url": "https://github.com/Leonxlnx"
+  },
+  "homepage": "https://github.com/afif25fradana/taste-skill",
+  "repository": "https://github.com/afif25fradana/taste-skill",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "frontend",
+    "design",
+    "taste",
+    "ui",
+    "websites"
+  ]
+}
