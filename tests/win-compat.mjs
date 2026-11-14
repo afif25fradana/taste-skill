@@ -446,3 +446,228 @@ test('perf.mjs (Wave 1): safe profile cleanup preserves alive runs and purges st
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('photos.mjs (Wave 2, SEC-02 & SEC-03): SAFE_NAME, fileIn, okUrl, foundEntry security validations', async () => {
+  const mod = await import(pathToFileURL(path.join(SCRIPTS, 'photos.mjs')).href);
+  const { SAFE_NAME, fileIn, LINK_HOSTS, okUrl, foundEntry } = mod;
+
+  assert.equal(typeof fileIn, 'function', 'photos.mjs must export fileIn');
+  assert.equal(typeof okUrl, 'function', 'photos.mjs must export okUrl');
+  assert.equal(typeof foundEntry, 'function', 'photos.mjs must export foundEntry');
+  assert.ok(SAFE_NAME instanceof RegExp, 'photos.mjs must export SAFE_NAME RegExp');
+
+  // SEC-02: SAFE_NAME & fileIn path traversal protection
+  const baseDir = makeTempDir('taste-photos-sec-');
+  try {
+    assert.equal(SAFE_NAME.test('photo-f12345-1280.jpg'), true);
+    assert.equal(SAFE_NAME.test('photo-326.webp'), true);
+    assert.equal(SAFE_NAME.test('../hack.jpg'), false);
+    assert.equal(SAFE_NAME.test('..\\hack.jpg'), false);
+    assert.equal(SAFE_NAME.test('/etc/passwd'), false);
+    assert.equal(SAFE_NAME.test('C:\\boot.ini'), false);
+    assert.equal(SAFE_NAME.test('bad name.jpg'), false);
+    assert.equal(SAFE_NAME.test('sub/dir/img.jpg'), false);
+    assert.equal(SAFE_NAME.test(''), false);
+    assert.equal(SAFE_NAME.test('.hidden'), false);
+
+    assert.equal(fileIn(baseDir, 'photo-1.jpg'), path.resolve(baseDir, 'photo-1.jpg'));
+    assert.throws(() => fileIn(baseDir, '../escape.jpg'), /refused the file name/);
+    assert.throws(() => fileIn(baseDir, '..\\escape.jpg'), /refused the file name/);
+    assert.throws(() => fileIn(baseDir, '/escape.jpg'), /refused the file name/);
+    assert.throws(() => fileIn(baseDir, 'invalid name.jpg'), /refused the file name/);
+
+    // SEC-02 & SEC-03: foundEntry rejects entries with 'files', invalid ID, bad URLs, untrusted hosts
+    assert.equal(foundEntry(null), 'not an entry');
+    assert.equal(foundEntry('string'), 'not an entry');
+    assert.equal(foundEntry([]), 'not an entry');
+    assert.equal(foundEntry({ id: 'f123', files: ['photo.jpg'] }), 'it lists files (only library frames have files)');
+    assert.equal(foundEntry({ id: '123' }), 'its id is not an f and a number');
+    assert.equal(foundEntry({ id: 'f123/../../hack' }), 'its id is not an f and a number');
+    assert.equal(foundEntry({ id: 'f123;rm -rf' }), 'its id is not an f and a number');
+    assert.equal(foundEntry({ id: 'f123', source: 'unsplash' }), 'its source is not commons');
+    assert.equal(
+      foundEntry({
+        id: 'f123',
+        source: 'commons',
+        url: 'https://evil.com/fake.jpg',
+      }),
+      'its url is not a Commons file on upload.wikimedia.org'
+    );
+    assert.equal(
+      foundEntry({
+        id: 'f123',
+        source: 'commons',
+        url: 'https://upload.wikimedia.org/wikipedia/commons/a/ab/Test.jpg',
+        page: 'javascript:alert(1)',
+      }),
+      'its page is not an http(s) link on commons.wikimedia.org'
+    );
+
+    // SEC-03: okUrl and link validation
+    assert.equal(okUrl('https://commons.wikimedia.org/wiki/File:Test.jpg', LINK_HOSTS.commons.page), true);
+    assert.equal(okUrl('https://upload.wikimedia.org/wikipedia/commons/a/ab/Test.jpg', ['upload.wikimedia.org'], true), true);
+    assert.equal(okUrl('http://upload.wikimedia.org/test.jpg', ['upload.wikimedia.org'], true), false, 'httpsOnly rejects http');
+    assert.equal(okUrl('javascript:alert(1)', LINK_HOSTS.commons.page), false);
+    assert.equal(okUrl('data:text/html,<script>alert(1)</script>', LINK_HOSTS.commons.page), false);
+    assert.equal(okUrl('https://evil.com/fake.jpg', ['upload.wikimedia.org']), false);
+    assert.equal(okUrl('https://user:pass@upload.wikimedia.org/pic.jpg', ['upload.wikimedia.org']), false);
+    assert.equal(okUrl('https://upload.wikimedia.org:8080/pic.jpg', ['upload.wikimedia.org']), false);
+    assert.equal(okUrl('https://upload.wikimedia.org/test\nnewline', ['upload.wikimedia.org']), false);
+    assert.equal(okUrl('https://upload.wikimedia.org/test"quote', ['upload.wikimedia.org']), false);
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('photos.mjs (Wave 2, SEC-04): escH, creditLine, creditList, and goodCredits validation', async () => {
+  const mod = await import(pathToFileURL(path.join(SCRIPTS, 'photos.mjs')).href);
+  const { escH, creditLine, creditList, creditWhy, goodCredits } = mod;
+
+  assert.equal(typeof escH, 'function', 'photos.mjs must export escH');
+  assert.equal(typeof creditLine, 'function', 'photos.mjs must export creditLine');
+  assert.equal(typeof creditList, 'function', 'photos.mjs must export creditList');
+  assert.equal(typeof goodCredits, 'function', 'photos.mjs must export goodCredits');
+
+  // escH escaping
+  assert.equal(escH('<script>alert("x & y")</script>'), '&lt;script&gt;alert(&quot;x &amp; y&quot;)&lt;/script&gt;');
+
+  // creditLine escapes creditSources and href
+  const dummyList = [
+    { source: '<img src=x onerror=alert(1)>', by: 'Artist & Co' },
+  ];
+  const lineHtml = creditLine(dummyList, 'credits.html?q="foo"&b=<bar>');
+  assert.equal(lineHtml.includes('<img'), false, 'creditLine must escape creditSources');
+  assert.equal(lineHtml.includes('&lt;img'), true);
+  assert.equal(lineHtml.includes('&quot;foo&quot;&amp;b=&lt;bar&gt;'), true, 'creditLine must escape href');
+
+  // creditList escapes photographer, page, and licenceUrl
+  const listHtml = creditList([
+    {
+      source: 'Wikimedia Commons',
+      id: 'f101',
+      by: '<script>evil()</script>',
+      page: 'https://commons.wikimedia.org/wiki/File:Test.jpg?x="1"&y=<2>',
+      licence: 'CC BY-SA 4.0',
+      licenceUrl: 'https://creativecommons.org/licenses/by-sa/4.0/?a="b"',
+    },
+  ]);
+  assert.equal(listHtml.includes('<script>'), false, 'creditList must escape by');
+  assert.equal(listHtml.includes('&lt;script&gt;evil()&lt;/script&gt;'), true);
+  assert.equal(listHtml.includes('&quot;1&quot;&amp;y=&lt;2&gt;'), true);
+
+  // goodCredits & creditWhy filter unsafe sources and links
+  assert.equal(creditWhy(null), 'not an entry');
+  assert.equal(creditWhy({ id: 'c1', source: 'malicious' }), 'its source is not Wikimedia Commons or Unsplash');
+  assert.equal(creditWhy({ id: 'c1', source: 'Unsplash', page: 'https://evil.com/photo' }), 'its page is not an http(s) link on unsplash.com');
+  const filtered = goodCredits({
+    photos: [
+      { id: 'ok1', source: 'Unsplash', page: 'https://unsplash.com/photos/123' },
+      { id: 'bad1', source: 'Unsplash', page: 'javascript:alert(1)' },
+      { id: 'bad2', source: 'EvilSource', page: 'https://evil.com' },
+    ],
+  }, 'credits.json');
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0].id, 'ok1');
+});
+
+test('photos.mjs (Wave 2, SEC-05): TASTE_SKILL_RECENT normalization to absolute path', () => {
+  const testRelPath = path.join('.', 'test-scratch-recent.json');
+  const res = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
+        process.env.TASTE_SKILL_RECENT = ${JSON.stringify(testRelPath)};
+        const { RECENT_FILE } = await import(${JSON.stringify(pathToFileURL(path.join(SCRIPTS, 'photos.mjs')).href)});
+        if (RECENT_FILE !== ${JSON.stringify(path.resolve(testRelPath))}) {
+          console.error('RECENT_FILE mismatch: ' + RECENT_FILE);
+          process.exit(1);
+        }
+      `,
+    ],
+    { encoding: 'utf8' }
+  );
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+});
+
+test('photos.mjs (Wave 2, SEC-06): BOM stripping on HTML templates in creditsPage', async () => {
+  const mod = await import(pathToFileURL(path.join(SCRIPTS, 'photos.mjs')).href);
+  const { creditsPage } = mod;
+  assert.equal(typeof creditsPage, 'function', 'photos.mjs must export creditsPage');
+
+  const dir = makeTempDir('taste-photos-bom-');
+  try {
+    const shellFile = path.join(dir, 'privacy.html');
+    // Write template with UTF-8 BOM
+    fs.writeFileSync(
+      shellFile,
+      '\uFEFF<!doctype html><html><head><title>Original</title></head><body><main class="wrap"><p>Legal</p></main></body></html>',
+      'utf8'
+    );
+    const outputHtml = creditsPage(
+      dir,
+      'credits.html',
+      [{ id: '326', source: 'Unsplash', by: 'Photographer', page: 'https://unsplash.com/photos/326' }],
+      'MyBrand'
+    );
+    assert.equal(outputHtml.startsWith('\uFEFF'), false, 'creditsPage must strip leading UTF-8 BOM');
+    assert.match(outputHtml, /MyBrand: photograph credits/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('photos.mjs (Wave 2, Fetch Redirect): ALLOWED_DOWNLOAD_HOSTS and download redirect validation', async () => {
+  const mod = await import(pathToFileURL(path.join(SCRIPTS, 'photos.mjs')).href);
+  const { ALLOWED_DOWNLOAD_HOSTS, download } = mod;
+
+  assert.ok(Array.isArray(ALLOWED_DOWNLOAD_HOSTS), 'photos.mjs must export ALLOWED_DOWNLOAD_HOSTS array');
+  assert.ok(ALLOWED_DOWNLOAD_HOSTS.includes('upload.wikimedia.org'));
+  assert.ok(ALLOWED_DOWNLOAD_HOSTS.includes('thumb.wikimedia.org'));
+  assert.ok(ALLOWED_DOWNLOAD_HOSTS.includes('picsum.photos'));
+  assert.ok(ALLOWED_DOWNLOAD_HOSTS.includes('fastly.picsum.photos'));
+  assert.equal(typeof download, 'function', 'photos.mjs must export download');
+
+  // Verify post-fetch redirected URL validation
+  const origFetch = globalThis.fetch;
+  try {
+    // 1. Untrusted redirect host must throw
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      url: 'https://malicious.attacker.com/exploit.jpg',
+      arrayBuffer: async () => new Uint8Array([0xff, 0xd8, 0xff, 0xe0]).buffer,
+    });
+    await assert.rejects(
+      () => download('https://upload.wikimedia.org/wikipedia/commons/test.jpg'),
+      /refused download from unexpected redirected host/
+    );
+
+    // 2. HTTP downgrade redirect must throw
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      url: 'http://upload.wikimedia.org/wikipedia/commons/test.jpg',
+      arrayBuffer: async () => new Uint8Array([0xff, 0xd8, 0xff, 0xe0]).buffer,
+    });
+    await assert.rejects(
+      () => download('https://upload.wikimedia.org/wikipedia/commons/test.jpg'),
+      /refused download from unexpected redirected host/
+    );
+
+    // 3. Valid download host with JPEG magic bytes passes
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      url: 'https://upload.wikimedia.org/wikipedia/commons/test.jpg',
+      arrayBuffer: async () => new Uint8Array([0xff, 0xd8, 0xff, 0xe0]).buffer,
+    });
+    const buf = await download('https://upload.wikimedia.org/wikipedia/commons/test.jpg');
+    assert.ok(buf instanceof Buffer);
+    assert.equal(buf[0], 0xff);
+    assert.equal(buf[1], 0xd8);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
