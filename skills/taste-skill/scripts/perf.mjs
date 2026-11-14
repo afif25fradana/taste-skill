@@ -33,27 +33,75 @@ import zlib from 'node:zlib';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { isInside, findBrowser, killTree } from './win-util.mjs';
+import { isInside, findBrowser, killTree, readJson } from './win-util.mjs';
 
-const args = process.argv.slice(2);
-const pos = [], widths = [];
-let profileArg = null, jsonOut = null, rootArg = null, RUNS = 3, PORT0 = 5740;
-const die = m => { console.error('perf: ' + m); process.exit(1); };
-const val = i => { const v = args[i + 1]; if (v == null || v.startsWith('--')) die(args[i] + ' needs a value'); return v; };
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--profile') profileArg = val(i++);
-  else if (args[i] === '--json') jsonOut = val(i++);
-  else if (args[i] === '--root') rootArg = path.resolve(val(i++));
-  else if (args[i] === '--w') { const w = +val(i++); if (!(w >= 200 && w <= 4000)) die('--w needs a width in px'); widths.push(w); }
-  else if (args[i] === '--port') { PORT0 = parseInt(val(i++), 10); if (!(PORT0 >= 1024 && PORT0 <= 65500)) die('--port needs a port from 1024 to 65500'); }
-  else if (args[i] === '--runs') RUNS = Math.max(1, Math.min(9, parseInt(val(i++), 10) || 3));
-  else if (args[i].startsWith('--')) die('unknown option ' + args[i]);
-  else pos.push(args[i]);
+const realOf = (p) => { try { return fs.realpathSync(p).toLowerCase(); } catch { return path.resolve(p).toLowerCase(); } };
+const isMain = process.argv[1] && realOf(process.argv[1]) === realOf(fileURLToPath(import.meta.url));
+
+export const alive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+};
+
+export function sweepProfiles(profileBase, currentPid = process.pid, currentHostname = os.hostname()) {
+  if (!fs.existsSync(profileBase)) return;
+  for (const d of fs.readdirSync(profileBase)) {
+    const m = d.match(/^run-(\d+)$/);
+    if (!m) continue;
+    const dirPid = Number(m[1]);
+    const dirPath = path.join(profileBase, d);
+    const ownerFile = path.join(dirPath, 'taste-skill-owner.json');
+    let isStale = false;
+    if (fs.existsSync(ownerFile)) {
+      try {
+        const owner = readJson(ownerFile, null);
+        if (owner && owner.machine === currentHostname && owner.ownerPid) {
+          if (owner.ownerPid === currentPid || !alive(owner.ownerPid)) {
+            isStale = true;
+          }
+        } else {
+          isStale = true;
+        }
+      } catch {
+        isStale = true;
+      }
+    } else {
+      if (dirPid === currentPid || !alive(dirPid)) {
+        isStale = true;
+      }
+    }
+    if (isStale) {
+      try {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+      } catch {
+        /* another run, or locked */
+      }
+    }
+  }
 }
-if (!pos.length) die('usage: perf.mjs <page.html | folder | url> [--profile <dir in the OS temp folder or .taste-skill>] [--json file] [--w 1440 --w 390] [--runs 3] [--port 5740] [--root <dir>]');
-if (typeof WebSocket === 'undefined' || typeof fetch === 'undefined') die('Node 22 or later is needed (global WebSocket and fetch)');
-if (!widths.length) widths.push(1440, 390);
-const target = pos[0];
+
+const die = m => { console.error('perf: ' + m); process.exit(1); };
+const widths = [];
+let profileArg = null, jsonOut = null, rootArg = null, RUNS = 3, PORT0 = 5740, target = '';
+
+if (isMain) {
+  const args = process.argv.slice(2);
+  const pos = [];
+  const val = i => { const v = args[i + 1]; if (v == null || v.startsWith('--')) die(args[i] + ' needs a value'); return v; };
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--profile') profileArg = val(i++);
+    else if (args[i] === '--json') jsonOut = val(i++);
+    else if (args[i] === '--root') rootArg = path.resolve(val(i++));
+    else if (args[i] === '--w') { const w = +val(i++); if (!(w >= 200 && w <= 4000)) die('--w needs a width in px'); widths.push(w); }
+    else if (args[i] === '--port') { PORT0 = parseInt(val(i++), 10); if (!(PORT0 >= 1024 && PORT0 <= 65500)) die('--port needs a port from 1024 to 65500'); }
+    else if (args[i] === '--runs') RUNS = Math.max(1, Math.min(9, parseInt(val(i++), 10) || 3));
+    else if (args[i].startsWith('--')) die('unknown option ' + args[i]);
+    else pos.push(args[i]);
+  }
+  if (!pos.length) die('usage: perf.mjs <page.html | folder | url> [--profile <dir in the OS temp folder or .taste-skill>] [--json file] [--w 1440 --w 390] [--runs 3] [--port 5740] [--root <dir>]');
+  if (typeof WebSocket === 'undefined' || typeof fetch === 'undefined') die('Node 22 or later is needed (global WebSocket and fetch)');
+  if (!widths.length) widths.push(1440, 390);
+  target = pos[0];
+}
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ---------------------------------------------------------------- budget */
@@ -342,8 +390,8 @@ function analyse(m, W, timed, glRun, load) {
 
 /* ---------------------------------------------------------------- report */
 const results = [];
-const label = target.replace(/\\/g, '/').split('/').slice(-3).join('/');
 function report(partial) {
+  const label = target ? target.replace(/\\/g, '/').split('/').slice(-3).join('/') : '';
   let fails = 0, warns = 0;
   for (const r of results) {
     console.log(`\nperf ${label} @ ${r.w}px`);
@@ -359,86 +407,92 @@ function report(partial) {
 }
 
 /* ---------------------------------------------------------------- run */
-let url = target, srvObj = null;
-if (!/^https?:/i.test(target)) {
-  const abs = path.resolve(/^file:/i.test(target) ? fileURLToPath(target) : target);
-  if (!fs.existsSync(abs)) die('not found: ' + abs);
-  const isDir = fs.statSync(abs).isDirectory(), dir = rootArg || (isDir ? abs : path.dirname(abs)), rel = path.relative(dir, abs);
-  if (!isInside(dir, abs, true)) { console.error(`perf: the page is not inside --root ${dir}: ${abs}`); process.exit(2); }
-  srvObj = await serve(dir);
-  url = `http://127.0.0.1:${srvObj.port}/` + rel.split(path.sep).map(encodeURIComponent).join('/') + (isDir && rel ? '/' : '');
-}
-// a profile stays in the OS temp folder or the project: a relative --profile that leads out of this folder (or the folder
-// itself) goes to .taste-skill/chrome-<name>
-const inProject = (p, name) => {
-  const abs = path.resolve(p), rel = path.relative(process.cwd(), abs);
-  const out = !path.isAbsolute(p) && (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel));
-  if (rel !== '' && !out) return abs;
-  const to = path.join(process.cwd(), '.taste-skill', 'chrome-' + name);
-  console.error(`${name}: --profile ${p} ${out ? 'leads outside the project folder' : 'is the project folder itself'}; using ${to} (a profile goes in the OS temp folder or the project's .taste-skill folder)`);
-  return to;
-};
-// a fresh profile folder per run (a reused one can still be locked by the Chrome just closed); removed once Chrome has exited
-// default profile folder: --profile, else $TASTE_SKILL_TMP/chrome/perf, else a folder under the system temp dir
-const profileBase = path.resolve(profileArg ? inProject(profileArg, 'perf') : (process.env.TASTE_SKILL_TMP ? path.join(process.env.TASTE_SKILL_TMP, 'chrome', 'perf') : path.join(os.tmpdir(), 'taste-skill-perf')));
-fs.mkdirSync(profileBase, { recursive: true });
-for (const d of fs.readdirSync(profileBase)) if (/^run-\d+$/.test(d)) { try { fs.rmSync(path.join(profileBase, d), { recursive: true, force: true }); } catch { /* another run, or locked */ } }
-const profile = path.join(profileBase, 'run-' + process.pid);
-fs.mkdirSync(profile, { recursive: true });
-const portFile = path.join(profile, 'DevToolsActivePort');
-const loadBefore = await hostLoad();
-const child = spawn(findChrome(), ['--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', '--disable-extensions',
-  '--hide-scrollbars', '--mute-audio', '--disable-gpu', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--window-size=1440,900', 'about:blank'], { stdio: 'ignore', windowsHide: true });
-const exited = new Promise(r => child.once('exit', r));
-const kill = () => killTree(child);
-const cleanupSync = () => {
-  kill();
-  try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch {}
-};
-child.on('error', () => {});
-const onSig = () => { cleanupSync(); process.exit(130); };
-process.once('exit', cleanupSync);
-for (const s of ['SIGINT', 'SIGTERM', 'SIGBREAK']) { try { process.once(s, onSig); } catch {} }
-// the guard scales with the work; on a timeout the results so far are printed, not lost
-const guard = setTimeout(() => { console.error('perf: timed out'); cleanupSync(); const f = report(true); process.exit(f ? 1 : 2); }, 150000 * widths.length * (RUNS + 1));
-let loadAfter = loadBefore;
-try {
-  let port = null;
-  for (let i = 0; i < 150 && !port; i++) { await sleep(100); try { port = parseInt(fs.readFileSync(portFile, 'utf8'), 10) || null; } catch { /* not yet */ } }
-  if (!port) throw new Error('Chrome did not start');
-  const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
-  const ws = new WebSocket(ver.webSocketDebuggerUrl);
-  await new Promise((r, j) => { ws.addEventListener('open', r, { once: true }); ws.addEventListener('error', j, { once: true }); });
-  let id = 0; const pend = new Map(), subs = new Set();
-  ws.addEventListener('message', e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } else subs.forEach(f => f(m)); });
-  const send = (method, params = {}, sessionId) => new Promise(r => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params, sessionId })); });
-  const S = async (sid, m, p) => { const r = await send(m, p, sid); if (r.error) throw new Error(`${m}: ${r.error.message}`); return r.result; };
-  const ev = async (sid, x) => (await S(sid, 'Runtime.evaluate', { expression: x, awaitPromise: true, returnByValue: true })).result.value;
-  const on = f => { subs.add(f); return () => subs.delete(f); };
-  const chrome = { send, S, ev, on };
-  const loads = [];
-  for (const W of widths) {
-    const H = W < 600 ? 844 : 900;
-    // load 1: WebGL as the page asks for it (counts, bytes, audit). If it made WebGL contexts, the timing comes from RUNS loads with WebGL off;
-    // otherwise load 1 is the first timing run and RUNS-1 more follow.
-    const first = await measure(chrome, url, W, H); first.vh = H;
-    const usesGl = first.atEnd.glCreated > 0;
-    const timed = usesGl ? [] : [first];
-    while (timed.length < RUNS) timed.push(await measure(chrome, url, W, H, usesGl));
-    const m = usesGl ? timed[0] : first; m.vh = H;
-    loads.push({ W, first, timed, m, usesGl });
-    results.push({ w: W, rows: analyse({ ...m, vh: H, audit: first.audit, reqs: first.reqs, loadReqs: first.loadReqs, errors: first.errors, docH: first.docH, stuck: first.stuck }, W, timed, first, loadBefore) });
+if (isMain) {
+  let url = target, srvObj = null;
+  if (!/^https?:/i.test(target)) {
+    const abs = path.resolve(/^file:/i.test(target) ? fileURLToPath(target) : target);
+    if (!fs.existsSync(abs)) die('not found: ' + abs);
+    const isDir = fs.statSync(abs).isDirectory(), dir = rootArg || (isDir ? abs : path.dirname(abs)), rel = path.relative(dir, abs);
+    if (!isInside(dir, abs, true)) { console.error(`perf: the page is not inside --root ${dir}: ${abs}`); process.exit(2); }
+    srvObj = await serve(dir);
+    url = `http://127.0.0.1:${srvObj.port}/` + rel.split(path.sep).map(encodeURIComponent).join('/') + (isDir && rel ? '/' : '');
   }
-  try { await Promise.race([send('Browser.close'), sleep(3000)]); } catch { /* closing */ }
-} finally {
-  clearTimeout(guard); kill(); if (srvObj) srvObj.srv.close();
-  await Promise.race([exited, sleep(4000)]);
-  for (let i = 0; i < 8; i++) { try { fs.rmSync(profile, { recursive: true, force: true }); break; } catch { await sleep(500); } }
+  // a profile stays in the OS temp folder or the project: a relative --profile that leads out of this folder (or the folder
+  // itself) goes to .taste-skill/chrome-<name>
+  const inProject = (p, name) => {
+    const abs = path.resolve(p), rel = path.relative(process.cwd(), abs);
+    const out = !path.isAbsolute(p) && (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel));
+    if (rel !== '' && !out) return abs;
+    const to = path.join(process.cwd(), '.taste-skill', 'chrome-' + name);
+    console.error(`${name}: --profile ${p} ${out ? 'leads outside the project folder' : 'is the project folder itself'}; using ${to} (a profile goes in the OS temp folder or the project's .taste-skill folder)`);
+    return to;
+  };
+  // a fresh profile folder per run (a reused one can still be locked by the Chrome just closed); removed once Chrome has exited
+  // default profile folder: --profile, else $TASTE_SKILL_TMP/chrome/perf, else a folder under the system temp dir
+  const profileBase = path.resolve(profileArg ? inProject(profileArg, 'perf') : (process.env.TASTE_SKILL_TMP ? path.join(process.env.TASTE_SKILL_TMP, 'chrome', 'perf') : path.join(os.tmpdir(), 'taste-skill-perf')));
+  fs.mkdirSync(profileBase, { recursive: true });
+  sweepProfiles(profileBase);
+  const profile = path.join(profileBase, 'run-' + process.pid);
+  fs.mkdirSync(profile, { recursive: true });
+  try {
+    fs.writeFileSync(path.join(profile, 'taste-skill-owner.json'), JSON.stringify({ machine: os.hostname(), ownerPid: process.pid, time: Date.now() }), 'utf8');
+  } catch {}
+  const portFile = path.join(profile, 'DevToolsActivePort');
+  try { fs.rmSync(portFile, { force: true }); } catch {}
+  const loadBefore = await hostLoad();
+  const child = spawn(findChrome(), ['--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+    '--hide-scrollbars', '--mute-audio', '--disable-gpu', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--window-size=1440,900', 'about:blank'], { stdio: 'ignore', windowsHide: true });
+  const exited = new Promise(r => child.once('exit', r));
+  const kill = () => killTree(child);
+  const cleanupSync = () => {
+    kill();
+    try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch {}
+  };
+  child.on('error', () => {});
+  const onSig = () => { cleanupSync(); process.exit(130); };
+  process.once('exit', cleanupSync);
+  for (const s of ['SIGINT', 'SIGTERM', 'SIGBREAK']) { try { process.once(s, onSig); } catch {} }
+  // the guard scales with the work; on a timeout the results so far are printed, not lost
+  const guard = setTimeout(() => { console.error('perf: timed out'); cleanupSync(); const f = report(true); process.exit(f ? 1 : 2); }, 150000 * widths.length * (RUNS + 1));
+  let loadAfter = loadBefore;
+  try {
+    let port = null;
+    for (let i = 0; i < 150 && !port; i++) { await sleep(100); try { port = parseInt(fs.readFileSync(portFile, 'utf8'), 10) || null; } catch { /* not yet */ } }
+    if (!port) throw new Error('Chrome did not start');
+    const ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+    const ws = new WebSocket(ver.webSocketDebuggerUrl);
+    await new Promise((r, j) => { ws.addEventListener('open', r, { once: true }); ws.addEventListener('error', j, { once: true }); });
+    let id = 0; const pend = new Map(), subs = new Set();
+    ws.addEventListener('message', e => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } else subs.forEach(f => f(m)); });
+    const send = (method, params = {}, sessionId) => new Promise(r => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params, sessionId })); });
+    const S = async (sid, m, p) => { const r = await send(m, p, sid); if (r.error) throw new Error(`${m}: ${r.error.message}`); return r.result; };
+    const ev = async (sid, x) => (await S(sid, 'Runtime.evaluate', { expression: x, awaitPromise: true, returnByValue: true })).result.value;
+    const on = f => { subs.add(f); return () => subs.delete(f); };
+    const chrome = { send, S, ev, on };
+    const loads = [];
+    for (const W of widths) {
+      const H = W < 600 ? 844 : 900;
+      // load 1: WebGL as the page asks for it (counts, bytes, audit). If it made WebGL contexts, the timing comes from RUNS loads with WebGL off;
+      // otherwise load 1 is the first timing run and RUNS-1 more follow.
+      const first = await measure(chrome, url, W, H); first.vh = H;
+      const usesGl = first.atEnd.glCreated > 0;
+      const timed = usesGl ? [] : [first];
+      while (timed.length < RUNS) timed.push(await measure(chrome, url, W, H, usesGl));
+      const m = usesGl ? timed[0] : first; m.vh = H;
+      loads.push({ W, first, timed, m, usesGl });
+      results.push({ w: W, rows: analyse({ ...m, vh: H, audit: first.audit, reqs: first.reqs, loadReqs: first.loadReqs, errors: first.errors, docH: first.docH, stuck: first.stuck }, W, timed, first, loadBefore) });
+    }
+    try { await Promise.race([send('Browser.close'), sleep(3000)]); } catch { /* closing */ }
+  } finally {
+    clearTimeout(guard); kill(); if (srvObj) srvObj.srv.close();
+    await Promise.race([exited, sleep(4000)]);
+    for (let i = 0; i < 8; i++) { try { fs.rmSync(profile, { recursive: true, force: true }); break; } catch { await sleep(500); } }
+  }
+  loadAfter = await hostLoad(800);
+  const load = Math.max(loadBefore, loadAfter);
+  for (const r of results) {
+    const h = r.rows[0]; h.value = `${loadBefore}/${loadAfter} %`;
+    if (load > 50) { h.verdict = 'WARN'; h.note = 'busy host: timing verdicts capped at WARN, rerun when idle'; r.rows.forEach(x => { if (x.verdict === 'FAIL' && /^(long tasks|blocking time|FCP|LCP)/.test(x.name)) x.verdict = 'WARN'; }); }
+  }
+  process.exit(report(false) ? 1 : 0);
 }
-loadAfter = await hostLoad(800);
-const load = Math.max(loadBefore, loadAfter);
-for (const r of results) {
-  const h = r.rows[0]; h.value = `${loadBefore}/${loadAfter} %`;
-  if (load > 50) { h.verdict = 'WARN'; h.note = 'busy host: timing verdicts capped at WARN, rerun when idle'; r.rows.forEach(x => { if (x.verdict === 'FAIL' && /^(long tasks|blocking time|FCP|LCP)/.test(x.name)) x.verdict = 'WARN'; }); }
-}
-process.exit(report(false) ? 1 : 0);

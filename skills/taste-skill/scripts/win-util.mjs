@@ -53,3 +53,8 @@ export function killTree(proc) {
     }
   }
 }
+
+export function slash(p) {
+  return typeof p === 'string' ? p.replace(/\\/g, '/') : p;
+}
+

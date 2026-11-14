@@ -24,8 +24,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isInside, findBrowser, killTree } from '../../scripts/win-util.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -46,16 +47,7 @@ const inProject = (p, name) => {
 const sizes = String(opt('sizes', '1440x900,1024x768,820x1180,768x1024,390x844')).split(',').map(s => s.split('x').map(Number));
 if (!target || target === true || rootArg === true) { console.error('usage: check.mjs --url <url or file> [--profile <dir in the OS temp folder or .taste-skill>] [--sizes 1440x900,1024x768,820x1180,768x1024,390x844] [--shots dir] [--root dir] [--json]'); process.exit(2); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const isInside = (parent, child, allowSelf = false) => {
-  const rel = path.relative(path.resolve(parent), path.resolve(child));
-  return rel ? rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel) : allowSelf;
-};
-const localChrome = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : null;
-const pf = process.env.PROGRAMFILES || 'C:\\Program Files', pf86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
-const chrome = [process.env.CHROME_PATH, process.env.CHROME, localChrome,
-  path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'), path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-  path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'), path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome', '/usr/bin/chromium'].find(p => p && fs.existsSync(p));
+const chrome = findBrowser();
 if (!chrome) { console.error('no Chrome found (set CHROME_PATH)'); process.exit(2); }
 const src = fs.readFileSync(path.join(here, 'layout-check.js'), 'utf8');
 // a page file is served from its folder (or --root) over http on 127.0.0.1 (5770-5779), never opened from file://
@@ -122,16 +114,8 @@ const [w0, h0] = sizes[0];
 const child = spawn(chrome, ['--headless=new', `--user-data-dir=${profile}`, '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check',
   '--disable-extensions', '--hide-scrollbars', '--mute-audio', '--disable-gpu', '--use-angle=swiftshader', '--enable-unsafe-swiftshader',
   `--window-size=${w0},${h0}`, 'about:blank'], { stdio: 'ignore', windowsHide: true });
-const kill = () => {
-  if (!child?.pid || child.exitCode !== null || child.signalCode) return;
-  if (process.platform === 'win32') {
-    try { execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); } catch {}
-  } else {
-    try { child.kill('SIGKILL'); } catch {}
-  }
-};
 const cleanup = () => {
-  kill();
+  killTree(child);
   try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch {}
 };
 child.on('error', () => {});

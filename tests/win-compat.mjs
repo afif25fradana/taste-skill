@@ -343,3 +343,106 @@ test('Install-AntigravityPlugin.ps1: parses multi-line agy plugin list --json un
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('check.mjs and win-util.mjs (Wave 1): check.mjs cleanly imports win-util.mjs and win-util exports slash', async () => {
+  const checkSrc = fs.readFileSync(path.join(ROOT, 'skills', 'taste-skill', 'assets', 'layout', 'check.mjs'), 'utf8');
+  assert.match(
+    checkSrc,
+    /import\s*\{[^}]*isInside[^}]*findBrowser[^}]*killTree[^}]*\}\s*from\s*['"]\.\.\/\.\.\/scripts\/win-util\.mjs['"]/,
+    'check.mjs must import isInside, findBrowser, killTree from win-util.mjs'
+  );
+  assert.equal(/const\s+isInside\s*=/.test(checkSrc), false, 'check.mjs must not duplicate isInside');
+  assert.equal(/const\s+localChrome\s*=/.test(checkSrc), false, 'check.mjs must not duplicate localChrome');
+  assert.equal(/const\s+kill\s*=/.test(checkSrc), false, 'check.mjs must not duplicate kill');
+
+  const winUtil = await import(pathToFileURL(path.join(SCRIPTS, 'win-util.mjs')).href);
+  assert.equal(typeof winUtil.slash, 'function', 'win-util.mjs must export slash');
+  assert.equal(typeof winUtil.isInside, 'function');
+  assert.equal(typeof winUtil.readJson, 'function');
+  assert.equal(typeof winUtil.killTree, 'function');
+  assert.equal(typeof winUtil.findBrowser, 'function');
+  assert.equal(winUtil.slash('path\\to\\file'), 'path/to/file');
+  assert.equal(winUtil.slash('path/to/file'), 'path/to/file');
+});
+
+test('perf.mjs (Wave 1): safe profile cleanup preserves alive runs and purges stale profiles', async () => {
+  const perfSrc = fs.readFileSync(path.join(SCRIPTS, 'perf.mjs'), 'utf8');
+  assert.equal(
+    /alive\s*=\s*\(?pid\)?\s*=>\s*\{\s*try\s*\{\s*process\.kill\(pid,\s*0\);?\s*return true;?\s*\}\s*catch\s*\(e\)\s*\{\s*return\s*e\.code\s*===\s*['"]EPERM['"];?\s*\}/.test(perfSrc),
+    true,
+    'perf.mjs must define alive(pid) treating EPERM as alive'
+  );
+  assert.equal(
+    perfSrc.includes('taste-skill-owner.json'),
+    true,
+    'perf.mjs must write and inspect taste-skill-owner.json'
+  );
+  assert.match(perfSrc, /fs\.rmSync\(portFile/, 'perf.mjs must guard against stale DevToolsActivePort');
+
+  const { sweepProfiles, alive } = await import(pathToFileURL(path.join(SCRIPTS, 'perf.mjs')).href);
+  assert.equal(typeof sweepProfiles, 'function', 'perf.mjs must export sweepProfiles');
+  assert.equal(typeof alive, 'function', 'perf.mjs must export alive');
+
+  const dir = makeTempDir('taste-perf-sweep-');
+  try {
+    const alivePid = process.pid;
+    const deadPid = 999999;
+    const currentPid = 12345;
+
+    // 1. Alive PID folder without owner file -> must NOT be removed
+    const aliveDir = path.join(dir, `run-${alivePid}`);
+    fs.mkdirSync(aliveDir, { recursive: true });
+
+    // 2. Dead PID folder without owner file -> MUST be removed
+    const deadDir = path.join(dir, `run-${deadPid}`);
+    fs.mkdirSync(deadDir, { recursive: true });
+
+    // 3. Stale folder matching current process PID -> MUST be removed
+    const currentDir = path.join(dir, `run-${currentPid}`);
+    fs.mkdirSync(currentDir, { recursive: true });
+
+    // 4. Alive folder with valid taste-skill-owner.json on same machine -> must NOT be removed
+    const aliveOwnerDir = path.join(dir, 'run-888888');
+    fs.mkdirSync(aliveOwnerDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(aliveOwnerDir, 'taste-skill-owner.json'),
+      JSON.stringify({ machine: os.hostname(), ownerPid: alivePid, time: Date.now() }),
+      'utf8'
+    );
+
+    // 5. Dead folder with taste-skill-owner.json (dead ownerPid) -> MUST be removed
+    const deadOwnerDir = path.join(dir, 'run-777777');
+    fs.mkdirSync(deadOwnerDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(deadOwnerDir, 'taste-skill-owner.json'),
+      JSON.stringify({ machine: os.hostname(), ownerPid: deadPid, time: Date.now() }),
+      'utf8'
+    );
+
+    // 6. Stale folder with taste-skill-owner.json (ownerPid matching currentPid) -> MUST be removed
+    const currentOwnerDir = path.join(dir, 'run-666666');
+    fs.mkdirSync(currentOwnerDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(currentOwnerDir, 'taste-skill-owner.json'),
+      JSON.stringify({ machine: os.hostname(), ownerPid: currentPid, time: Date.now() }),
+      'utf8'
+    );
+
+    // 7. Non-matching directory should NOT be removed
+    const customDir = path.join(dir, 'custom-folder');
+    fs.mkdirSync(customDir, { recursive: true });
+
+    sweepProfiles(dir, currentPid, os.hostname());
+
+    assert.equal(fs.existsSync(aliveDir), true, 'alive PID run dir must NOT be removed');
+    assert.equal(fs.existsSync(aliveOwnerDir), true, 'alive ownerPid run dir must NOT be removed');
+    assert.equal(fs.existsSync(customDir), true, 'non-run dir must NOT be removed');
+
+    assert.equal(fs.existsSync(deadDir), false, 'dead PID run dir must be removed');
+    assert.equal(fs.existsSync(currentDir), false, 'recycled current PID run dir must be removed');
+    assert.equal(fs.existsSync(deadOwnerDir), false, 'dead ownerPid run dir must be removed');
+    assert.equal(fs.existsSync(currentOwnerDir), false, 'recycled ownerPid run dir must be removed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
