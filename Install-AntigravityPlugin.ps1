@@ -1,11 +1,17 @@
 [CmdletBinding(SupportsShouldProcess = $true, PositionalBinding = $false)]
 param(
     [switch]$Link,
+    [switch]$Sync,
+    [switch]$Force,
     [switch]$Uninstall
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($Link) {
+    throw 'The -Link switch is deprecated. NTFS junctions and symlinks across drive boundaries fail Antigravity Language Server path confinement (isGlobalPluginDir). Use default physical installation or -Sync for live repository synchronization.'
+}
 
 $RepoRoot = $PSScriptRoot
 $PluginName = 'taste-skill'
@@ -96,45 +102,62 @@ if ($Uninstall) {
 
 Remove-LegacySkill
 
-if ($Link) {
-    if ($isJunction) {
-        if ($PSCmdlet.ShouldProcess($PluginDest, 'Remove existing plugin NTFS junction')) {
-            [System.IO.Directory]::Delete($PluginDest, $false)
-        }
-    } elseif ($existing) {
-        if ($PSCmdlet.ShouldProcess($PluginName, 'Uninstall existing plugin copy before linking')) {
-            & agy plugin uninstall $PluginName
-            if ($LASTEXITCODE -ne 0) {
-                throw "agy plugin uninstall $PluginName failed with exit code $LASTEXITCODE"
-            }
-        }
-        if (Get-Item -LiteralPath $PluginDest -Force -ErrorAction SilentlyContinue) {
-            throw "Existing directory at $PluginDest could not be removed before creating junction."
+if ($isJunction) {
+    if ($PSCmdlet.ShouldProcess($PluginDest, 'Remove existing plugin NTFS junction before install')) {
+        [System.IO.Directory]::Delete($PluginDest, $false)
+        $existing = $null
+        $isJunction = $false
+    }
+}
+
+if (-not (Test-Path -LiteralPath $PluginsDir -PathType Container)) {
+    if ($PSCmdlet.ShouldProcess($PluginsDir, 'Create Antigravity plugins directory')) {
+        New-Item -ItemType Directory -Path $PluginsDir -Force | Out-Null
+    }
+}
+
+$resolvedDest = [System.IO.Path]::GetFullPath($PluginDest)
+$expectedSuffix = [System.IO.Path]::Combine('.gemini', 'config', 'plugins', $PluginName)
+if (-not $resolvedDest.EndsWith($expectedSuffix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to mirror into unexpected destination: $resolvedDest"
+}
+
+$actionDesc = if ($Sync) { "Sync repository to $PluginDest via robocopy" } else { "Install Antigravity plugin $PluginName" }
+if ($PSCmdlet.ShouldProcess($PluginDest, $actionDesc)) {
+    $roboOut = & robocopy "$RepoRoot" "$PluginDest" /mir /xd .git node_modules .gemini .github tests examples .taste-skill /xf .gitignore *.tmp *.log package.json package-lock.json
+    if ($LASTEXITCODE -ge 8) {
+        Write-Error ($roboOut | Out-String)
+        throw "robocopy failed with exit code $LASTEXITCODE"
+    }
+
+    $pruneDirs = @('.github', 'tests', 'examples', '.taste-skill')
+    foreach ($dirName in $pruneDirs) {
+        $targetDir = Join-Path $PluginDest $dirName
+        if (Test-Path -LiteralPath $targetDir -PathType Container) {
+            [System.IO.Directory]::Delete($targetDir, $true)
         }
     }
-    if (-not (Test-Path -LiteralPath $PluginsDir -PathType Container)) {
-        if ($PSCmdlet.ShouldProcess($PluginsDir, 'Create Antigravity plugins directory')) {
-            New-Item -ItemType Directory -Path $PluginsDir -Force | Out-Null
-        }
-    }
-    if ($PSCmdlet.ShouldProcess($PluginDest, "Create NTFS junction to $RepoRoot")) {
-        New-Item -ItemType Junction -Path $PluginDest -Target $RepoRoot | Out-Null
-    }
-} else {
-    if ($isJunction) {
-        if ($PSCmdlet.ShouldProcess($PluginDest, 'Remove existing plugin NTFS junction before install')) {
-            [System.IO.Directory]::Delete($PluginDest, $false)
-        }
-    }
-    if ($PSCmdlet.ShouldProcess($RepoRoot, "Install Antigravity plugin $PluginName")) {
-        & agy plugin install $RepoRoot
-        if ($LASTEXITCODE -ne 0) {
-            throw "agy plugin install failed with exit code $LASTEXITCODE"
+    $pruneFiles = @('.gitignore', 'package.json', 'package-lock.json')
+    foreach ($fileName in $pruneFiles) {
+        $targetFile = Join-Path $PluginDest $fileName
+        if (Test-Path -LiteralPath $targetFile -PathType Leaf) {
+            [System.IO.File]::Delete($targetFile)
         }
     }
 }
 
 if (-not $WhatIfPreference) {
+    $destItem = Get-Item -LiteralPath $PluginDest -Force -ErrorAction SilentlyContinue
+    if (-not $destItem) {
+        throw "Plugin destination '$PluginDest' does not exist after installation."
+    }
+    if (-not $destItem.PSIsContainer) {
+        throw "Plugin destination '$PluginDest' is not a directory container."
+    }
+    if (($destItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Plugin destination '$PluginDest' must be a physical directory, not an NTFS junction or symlink."
+    }
+
     $listRaw = & agy plugin list --json
     if ($LASTEXITCODE -ne 0) {
         throw "agy plugin list --json failed with exit code $LASTEXITCODE"
@@ -164,5 +187,34 @@ if (-not $WhatIfPreference) {
     }
     $pathProp = $entry.PSObject.Properties['path']
     $entryPath = if ($pathProp) { $pathProp.Value } else { '' }
+
+    if ($env:ANTIGRAVITY_LS_ADDRESS) {
+        $lsAddress = $env:ANTIGRAVITY_LS_ADDRESS
+        $rpcUrl = "http://$lsAddress/exa.language_server_pb.LanguageServerService/GetAllPlugins"
+        $headers = @{ 'Content-Type' = 'application/json' }
+        if ($env:ANTIGRAVITY_CSRF_TOKEN) {
+            $headers['x-codeium-csrf-token'] = $env:ANTIGRAVITY_CSRF_TOKEN
+        }
+        $timeout = [System.Diagnostics.Stopwatch]::StartNew()
+        $registered = $false
+        $lastError = 'none'
+        while ($timeout.ElapsedMilliseconds -lt 10000) {
+            try {
+                $rpcResponse = Invoke-RestMethod -Uri $rpcUrl -Method Post -Body '{}' -Headers $headers -TimeoutSec 3 -ErrorAction Stop
+                $lsPlugins = @($rpcResponse.plugins)
+                if ($lsPlugins | Where-Object { $_ -and $_.name -eq $PluginName }) {
+                    $registered = $true
+                    break
+                }
+            } catch {
+                $lastError = $_.Exception.Message
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $registered) {
+            throw "Plugin '$PluginName' did not register with Language Server at $lsAddress within 10 seconds (Last error: $lastError)."
+        }
+    }
+
     Write-Output "Installed and verified '$PluginName' (enabled=$($enabledProp.Value), path=$entryPath)."
 }

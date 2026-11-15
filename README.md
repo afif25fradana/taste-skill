@@ -40,10 +40,11 @@ Install from a local clone in PowerShell:
 .\Install-AntigravityPlugin.ps1
 ```
 
-[`Install-AntigravityPlugin.ps1`](Install-AntigravityPlugin.ps1) checks root [`LICENSE`](LICENSE) and [`skills/taste-skill/SKILL.md`](skills/taste-skill/SKILL.md) (UTF-8 without BOM, within the 24,000-byte body limit), prunes any legacy `$HOME\.agents\skills\design-taste-frontend` directory or junction, runs `agy plugin validate --strict`, installs the plugin, and verifies the entry with `agy plugin list --json`.
+[`Install-AntigravityPlugin.ps1`](Install-AntigravityPlugin.ps1) checks root [`LICENSE`](LICENSE) and [`skills/taste-skill/SKILL.md`](skills/taste-skill/SKILL.md) (UTF-8 without BOM, within the 24,000-byte body limit), prunes any legacy `$HOME\.agents\skills\design-taste-frontend` directory or junction, runs `agy plugin validate --strict`, physically copies the plugin files to `$HOME\.gemini\config\plugins\taste-skill` via `robocopy /mir` (excluding non-runtime and development folders), and verifies the entry with `agy plugin list --json` and the Language Server Connect RPC.
 
-- Link from the clone with `.\Install-AntigravityPlugin.ps1 -Link` to create an NTFS junction at `$HOME\.gemini\config\plugins\taste-skill` so `git pull` updates the plugin in place.
-- Remove the installed plugin (or junction) and any legacy `$HOME\.agents\skills\design-taste-frontend` folder with `.\Install-AntigravityPlugin.ps1 -Uninstall`.
+- Refresh or overwrite the physical copy: `powershell -ExecutionPolicy Bypass -File .\Install-AntigravityPlugin.ps1 -Force`.
+- Sync live repository changes during active development: `.\Install-AntigravityPlugin.ps1 -Sync`.
+- Remove the installed plugin and any legacy `$HOME\.agents\skills\design-taste-frontend` folder: `.\Install-AntigravityPlugin.ps1 -Uninstall`.
 
 Or run the Antigravity CLI commands manually from the repository root:
 

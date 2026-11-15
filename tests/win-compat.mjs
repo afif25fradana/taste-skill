@@ -2,9 +2,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -276,7 +277,6 @@ test('Install-AntigravityPlugin.ps1: parses multi-line agy plugin list --json un
       [
         '@echo off',
         'if "%1"=="plugin" if "%2"=="validate" exit /b 0',
-        'if "%1"=="plugin" if "%2"=="install" exit /b 0',
         `if "%1"=="plugin" if "%2"=="list" type "${jsonPath}" & exit /b 0`,
         'exit /b 1',
         '',
@@ -293,6 +293,8 @@ test('Install-AntigravityPlugin.ps1: parses multi-line agy plugin list --json un
       HOMEDRIVE: parsedHome.root.slice(0, 2),
       HOMEPATH: tempHome.slice(2),
     };
+    delete env.ANTIGRAVITY_LS_ADDRESS;
+    delete env.ANTIGRAVITY_CSRF_TOKEN;
 
     const runInstaller = (payload) => {
       fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2), 'utf8');
@@ -339,6 +341,161 @@ test('Install-AntigravityPlugin.ps1: parses multi-line agy plugin list --json un
     assert.notEqual(emptyList.status, 0);
     assert.equal(/PropertyNotFoundStrict/.test(emptyList.stderr), false, emptyList.stderr);
     assert.match(emptyList.stderr, /was not found/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Install-AntigravityPlugin.ps1: deprecates -Link, copies physical directory, supports -Sync and verifies Connect RPC', { skip: process.platform !== 'win32' ? 'Windows-only' : false }, async () => {
+  const ps1 = path.join(ROOT, 'Install-AntigravityPlugin.ps1');
+  const dir = makeTempDir('taste-ps1-phase3-');
+  try {
+    const binDir = path.join(dir, 'bin');
+    const tempHome = path.join(dir, 'home');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(tempHome, { recursive: true });
+
+    const jsonPath = path.join(dir, 'plugins.json');
+    const validPluginList = [
+      {
+        name: 'taste-skill',
+        enabled: true,
+        version: '2.5.1',
+        path: path.join(tempHome, '.gemini', 'config', 'plugins', 'taste-skill'),
+        skills: ['taste-skill'],
+      },
+    ];
+    fs.writeFileSync(jsonPath, JSON.stringify(validPluginList, null, 2), 'utf8');
+
+    const agyCmd = path.join(binDir, 'agy.cmd');
+    fs.writeFileSync(
+      agyCmd,
+      [
+        '@echo off',
+        'if "%1"=="plugin" if "%2"=="validate" exit /b 0',
+        `if "%1"=="plugin" if "%2"=="list" type "${jsonPath}" & exit /b 0`,
+        'exit /b 1',
+        '',
+      ].join('\r\n'),
+      'utf8'
+    );
+
+    const parsedHome = path.parse(tempHome);
+    const baseEnv = {
+      ...process.env,
+      PATH: `${binDir};${process.env.PATH || ''}`,
+      HOME: tempHome,
+      USERPROFILE: tempHome,
+      HOMEDRIVE: parsedHome.root.slice(0, 2),
+      HOMEPATH: tempHome.slice(2),
+    };
+    delete baseEnv.ANTIGRAVITY_LS_ADDRESS;
+    delete baseEnv.ANTIGRAVITY_CSRF_TOKEN;
+
+    const run = (args = [], extraEnv = {}) =>
+      new Promise((resolve) => {
+        const proc = spawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, ...args],
+          { env: { ...baseEnv, ...extraEnv } }
+        );
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', (d) => { stdout += d; });
+        proc.stderr.on('data', (d) => { stderr += d; });
+        proc.on('close', (status) => resolve({ status, stdout, stderr }));
+      });
+
+    // 1. -Link must throw terminating deprecation error mentioning isGlobalPluginDir
+    const linkRes = await run(['-Link']);
+    assert.notEqual(linkRes.status, 0, 'installer with -Link should exit non-zero');
+    assert.match(linkRes.stderr, /is deprecated/i, '-Link must explain deprecation');
+    assert.match(linkRes.stderr, /isGlobalPluginDir/i, '-Link must cite isGlobalPluginDir confinement');
+
+    // 2. Default installation must perform physical copy and remove existing junction
+    const pluginDest = path.join(tempHome, '.gemini', 'config', 'plugins', 'taste-skill');
+    fs.mkdirSync(path.dirname(pluginDest), { recursive: true });
+    const dummyTarget = path.join(dir, 'dummy-target');
+    fs.mkdirSync(dummyTarget, { recursive: true });
+    spawnSync('cmd.exe', ['/c', 'mklink', '/J', pluginDest, dummyTarget], { encoding: 'utf8' });
+
+    const installRes = await run(['-Force']);
+    assert.equal(installRes.status, 0, installRes.stderr || installRes.stdout);
+    assert.match(installRes.stdout, /Installed and verified 'taste-skill'/);
+    assert.equal(fs.existsSync(path.join(pluginDest, 'plugin.json')), true, 'physical plugin.json must exist');
+    assert.equal(fs.existsSync(path.join(pluginDest, 'skills', 'taste-skill', 'SKILL.md')), true, 'physical SKILL.md must exist');
+
+    const checkReparse = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$item = Get-Item -LiteralPath '${pluginDest.replace(/'/g, "''")}'; if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 1 } else { exit 0 }`,
+      ],
+      { encoding: 'utf8' }
+    );
+    assert.equal(checkReparse.status, 0, 'pluginDest must be a physical directory, not ReparsePoint');
+
+    const nonRuntimeDirs = ['.github', 'tests', 'examples', '.taste-skill'];
+    for (const d of nonRuntimeDirs) {
+      assert.equal(
+        fs.existsSync(path.join(pluginDest, d)),
+        false,
+        `non-runtime folder '${d}' must be excluded from plugin destination`
+      );
+    }
+    const nonRuntimeFiles = ['.gitignore', 'package.json', 'package-lock.json'];
+    for (const f of nonRuntimeFiles) {
+      assert.equal(
+        fs.existsSync(path.join(pluginDest, f)),
+        false,
+        `non-runtime file '${f}' must be excluded from plugin destination`
+      );
+    }
+
+    // Seed non-runtime folders in pluginDest to verify explicit pruning
+    const staleTestDir = path.join(pluginDest, 'tests');
+    fs.mkdirSync(staleTestDir, { recursive: true });
+    fs.writeFileSync(path.join(staleTestDir, 'stale.txt'), 'stale', 'utf8');
+
+    // 3. -Sync switch must succeed and prune stale non-runtime directories
+    const syncRes = await run(['-Sync']);
+    assert.equal(syncRes.status, 0, syncRes.stderr || syncRes.stdout);
+    assert.equal(
+      fs.existsSync(staleTestDir),
+      false,
+      'stale non-runtime folder should be explicitly pruned'
+    );
+
+    // 4. Connect RPC verification: test passing when LS returns taste-skill
+    let rpcResponsePayload = { plugins: [{ name: 'taste-skill' }] };
+    const mockLsServer = http.createServer((req, res) => {
+      req.resume();
+      if (req.method === 'POST' && req.url === '/exa.language_server_pb.LanguageServerService/GetAllPlugins') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(rpcResponsePayload));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+
+    await new Promise((resolve) => mockLsServer.listen(0, '127.0.0.1', resolve));
+    const port = mockLsServer.address().port;
+    try {
+      const lsEnv = { ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${port}` };
+      const rpcPassRes = await run(['-Force'], lsEnv);
+      assert.equal(rpcPassRes.status, 0, rpcPassRes.stderr || rpcPassRes.stdout);
+
+      // Connect RPC verification: test failing when LS omits taste-skill
+      rpcResponsePayload = { plugins: [{ name: 'chrome-devtools-plugin' }] };
+      const rpcFailRes = await run(['-Force'], lsEnv);
+      assert.notEqual(rpcFailRes.status, 0, 'installer must fail when Connect RPC omits taste-skill');
+      assert.match(rpcFailRes.stderr, /did not register|not registered/i);
+    } finally {
+      await new Promise((resolve) => mockLsServer.close(resolve));
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
