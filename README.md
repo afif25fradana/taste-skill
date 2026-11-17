@@ -6,6 +6,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/afif25fradana/taste-skill/actions/workflows/check-skills.yml"><img src="https://github.com/afif25fradana/taste-skill/actions/workflows/check-skills.yml/badge.svg" alt="CI Status" /></a>
+  &nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-24292f?style=flat&amp;logo=github&amp;logoColor=white" alt="MIT License" /></a>
   &nbsp;
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-view-24292f?style=flat" alt="Changelog" /></a>
@@ -13,9 +15,12 @@
 
 # Taste Skill
 
-**Taste Skill** is a Google Antigravity plugin for building company websites without AI slop. It provides curated typography pairings, harmonic palettes, a starter foundation, and an automated browser quality gate that validates rendered pages in a real browser before delivery.
+**Taste Skill** is an experimental Google Antigravity skill for building craft company websites. It provides curated typography pairings, harmonic palettes, a starter foundation, and an automated headless Chrome quality gate that checks rendered pages for layout overflow and contrast before delivery.
 
 Adapted for Google Antigravity on Windows 11 from [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill) under the [MIT License](LICENSE).
+
+> [!NOTE]
+> Within the `everyday-agy` workflow fleet, `taste-skill` was retired in ADR-0002 in favor of the upstream `impeccable` skill suite. This repository is maintained as an independent, standalone reference and CLI gate. Requires Node.js 22+ (Active/Maintenance LTS).
 
 Pages built from a single brief in earlier v2 runs:
 
